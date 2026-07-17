@@ -128,8 +128,17 @@ def paste_patch_on_box(image, patch, box, transform_params):
     return out
 
 
-def eot_composite(image, patch, box):
-    """Convenience wrapper: sample random transform, paste patch, return image."""
+def eot_composite(image, patch, box, scale_range=(0.15, 0.35)):
+    """Convenience wrapper: sample random transform, paste patch, return
+    (composited_image, params). Params are returned (not just used
+    internally) so callers can log what scale/rotation/etc was actually
+    drawn each step -- needed to check whether loss behavior correlates
+    with patch-to-person coverage ratio (occlusion) vs something else.
+
+    scale_range is forwarded to random_transform_params so callers (train.py)
+    can widen it via CLI to push more training mass into higher-coverage
+    conditions, where the coverage-bucket analysis showed the biggest
+    trained-vs-gray gap."""
     _, img_h, img_w = image.shape
-    params = random_transform_params(img_h, img_w)
-    return paste_patch_on_box(image, patch, box, params)
+    params = random_transform_params(img_h, img_w, scale_range=scale_range)
+    return paste_patch_on_box(image, patch, box, params), params

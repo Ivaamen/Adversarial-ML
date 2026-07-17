@@ -31,11 +31,28 @@ def objectness_loss(raw_preds, target_box, person_class_id=0, iou_thresh=0.1):
                step (see train.py for how this is extracted).
     target_box: the person bbox being attacked, in the same coord system.
 
-    Returns the max (objectness * person_class_score) over predictions that
-    overlap target_box — this is what we minimize.
+    Returns (loss, n_kept):
+        loss   - max (objectness * person_class_score) over predictions that
+                 overlap target_box. This is what we minimize.
+        n_kept - how many raw anchors passed the IoU filter. Callers should
+                 log this: if it's 0 on a meaningful fraction of steps, the
+                 "loss" for those steps is not connected to the patch at all
+                 (see fallback below), and averaging it in with real steps
+                 will mask a dead-gradient problem as a slow plateau.
+
+    IMPORTANT: raw_preds must still require grad here (i.e. be the live
+    output of get_raw_predictions on a graph rooted at `patch`, not a
+    detached/copied tensor) or the fallback path below has nothing to
+    attach to either.
     """
     if raw_preds.shape[0] == 0:
-        return torch.tensor(0.0, requires_grad=True)
+        # No anchors at all (shouldn't happen for YOLO, but just in case).
+        # A fresh tensor here is FOR REAL disconnected from the patch -- this
+        # previously used requires_grad=True on a leaf, which does NOT create
+        # a path back to the patch. There is no way to get a gradient signal
+        # out of literally zero predictions, so the honest thing is to make
+        # that visible rather than fake a connected zero.
+        return raw_preds.sum() * 0.0, 0
 
     boxes = raw_preds[:, :4]
     objectness = raw_preds[:, 4]
@@ -54,12 +71,24 @@ def objectness_loss(raw_preds, target_box, person_class_id=0, iou_thresh=0.1):
             keep.append(i)
 
     if not keep:
-        return torch.tensor(0.0, requires_grad=True)
+        # FIX: this was `torch.tensor(0.0, requires_grad=True)` — a brand new
+        # leaf tensor with NO connection to raw_preds or patch whatsoever.
+        # backward() on it is a no-op for patch.grad: nothing accumulates,
+        # but the step still *looks* like a normal iteration in the tqdm log
+        # (obj loss = 0.000 gets averaged into epoch_obj_loss like real data).
+        #
+        # Fix: fall back to the single highest-scoring anchor overall
+        # (still connected to raw_preds -> patch through autograd), instead
+        # of a disconnected constant. This keeps every step differentiable,
+        # even the ones where nothing overlapped target_box tightly enough.
+        # It's a softer signal ("push down whatever YOLO's most confident
+        # about anywhere") rather than no signal at all.
+        return scores.max(), 0
 
     keep_idx = torch.tensor(keep, device=raw_preds.device)
     relevant_scores = scores[keep_idx]
 
-    return relevant_scores.max()
+    return relevant_scores.max(), len(keep)
 
 
 def tv_loss(patch):
@@ -71,6 +100,6 @@ def tv_loss(patch):
 
 
 def total_loss(raw_preds, target_box, patch, tv_weight=2.5e-3, person_class_id=0):
-    obj_loss = objectness_loss(raw_preds, target_box, person_class_id)
+    obj_loss, n_kept = objectness_loss(raw_preds, target_box, person_class_id)
     tv = tv_loss(patch)
-    return obj_loss + tv_weight * tv, obj_loss.item(), tv.item()
+    return obj_loss + tv_weight * tv, obj_loss.item(), tv.item(), n_kept

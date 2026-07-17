@@ -12,7 +12,9 @@ nn.Module) directly to get raw output.
 """
 
 import argparse
+import csv
 import os
+import random
 import torch
 from torch.utils.data import DataLoader
 from ultralytics import YOLO
@@ -20,7 +22,7 @@ from tqdm import tqdm
 
 from patch import init_patch, eot_composite
 from loss import total_loss
-from dataset import INRIAPersonDataset, collate_single
+from dataset import CocoPersonDataset, collate_single
 
 
 def get_raw_predictions(yolo_model, image_batch):
@@ -54,14 +56,56 @@ def get_raw_predictions(yolo_model, image_batch):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="data/INRIAPerson")
+    parser.add_argument("--data", default="data/coco")
+    parser.add_argument("--split", default="train", choices=["train", "valid", "test"])
     parser.add_argument("--model", default="yolov8n.pt")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--patch-size", type=int, default=300)
     parser.add_argument("--img-size", type=int, default=416)
     parser.add_argument("--lr", type=float, default=0.03)
+    parser.add_argument("--tv-weight", type=float, default=2.5e-3,
+                         help="Weight on the total-variation smoothness "
+                              "penalty. Lower = less pressure toward smooth/"
+                              "printable patches, more room for the "
+                              "optimizer to find aggressive high-frequency "
+                              "patterns. Tradeoff: too low risks converging "
+                              "to unprintable single-pixel noise (the exact "
+                              "failure mode tv_loss exists to prevent).")
+    parser.add_argument("--scale-min", type=float, default=0.15,
+                         help="Min patch size as fraction of person bbox "
+                              "height, sampled per EOT step.")
+    parser.add_argument("--scale-max", type=float, default=0.35,
+                         help="Max patch size as fraction of person bbox "
+                              "height, sampled per EOT step. Coverage-bucket "
+                              "analysis showed the trained-vs-gray gap peaks "
+                              "around coverage_ratio 0.25-0.5; raising this "
+                              "shifts more training steps into that regime. "
+                              "NOTE: this changes what the patch is being "
+                              "optimized for -- a patch trained at larger "
+                              "scale is a different (less realistic as a "
+                              "small torso patch) attack, not just a better-"
+                              "trained version of the same one.")
     parser.add_argument("--out", default="outputs")
+    parser.add_argument("--seed", type=int, default=42,
+                         help="RNG seed. Doesn't change the science, just makes "
+                              "'did my code change' vs 'did the random draw change' "
+                              "answerable while debugging.")
+    parser.add_argument("--gray-baseline", action="store_true",
+                         help="Run the same loop with a fixed flat-gray patch "
+                              "(no training, no optimizer step) instead of "
+                              "learning a patch. Use with the SAME --seed as a "
+                              "real training run so the image order and EOT "
+                              "param draws (scale/rotation/etc) line up step "
+                              "for step -- this gives a matched comparison: "
+                              "same coverage_ratio at the same step means same "
+                              "image+box+scale, so any obj_loss difference at "
+                              "matched coverage is attributable to patch "
+                              "CONTENT (adversarial pattern vs gray), not to "
+                              "which images/placements got sampled.")
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     os.makedirs(args.out, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,44 +115,118 @@ def main():
     for p in yolo.model.parameters():
         p.requires_grad_(False)  # freeze detector weights — only the patch trains
 
-    dataset = INRIAPersonDataset(args.data, img_size=args.img_size)
+    dataset = CocoPersonDataset(args.data, split=args.split, img_size=args.img_size)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_single)
 
     patch = init_patch(size=args.patch_size, mode="gray").to(device)
-    patch.requires_grad_(True)
-    optimizer = torch.optim.Adam([patch], lr=args.lr)
+    if args.gray_baseline:
+        # Fixed gray, never updated -- requires_grad stays True only because
+        # loss.py/autograd need SOME leaf with grad in the graph to trace
+        # back through (e.g. tv_loss, and objectness_loss's own graph), but
+        # we simply never call optimizer.step() so it never actually moves.
+        patch.requires_grad_(True)
+        optimizer = torch.optim.Adam([patch], lr=args.lr)  # unused, never .step()'d
+    else:
+        patch.requires_grad_(True)
+        optimizer = torch.optim.Adam([patch], lr=args.lr)
 
+    # Per-step diagnostic log (CSV, written incrementally, flushed every step).
+    # This is the thing that would have caught the dead-gradient bug in ~10
+    # steps instead of 5 epochs: grad_mean/grad_max show whether gradients are
+    # healthy, and n_kept/empty_keep show whether objectness_loss is actually
+    # connected to the current step's prediction, or silently a no-op.
+    log_name = "train_log_gray_baseline.csv" if args.gray_baseline else "train_log.csv"
+    log_path = os.path.join(args.out, log_name)
+    log_file = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow([
+        "epoch", "step", "obj_loss", "tv_loss", "n_kept", "empty_keep",
+        "grad_mean", "grad_max", "grad_is_none",
+        "box_h", "box_w", "scale", "patch_size", "coverage_ratio",
+    ])
+
+    global_step = 0
     for epoch in range(args.epochs):
         epoch_obj_loss, epoch_tv_loss, n = 0.0, 0.0, 0
+        epoch_empty_keep = 0
         pbar = tqdm(loader, desc=f"epoch {epoch+1}/{args.epochs}")
 
         for batch in pbar:
             image, target_box, _all_boxes = batch[0]
             image = image.to(device)
 
-            composited = eot_composite(image, patch, target_box)
+            composited, eot_params = eot_composite(
+                image, patch, target_box,
+                scale_range=(args.scale_min, args.scale_max),
+            )
             raw_preds = get_raw_predictions(yolo, composited.unsqueeze(0))
 
-            loss, obj_l, tv_l = total_loss(raw_preds, target_box, patch)
+            loss, obj_l, tv_l, n_kept = total_loss(
+                raw_preds, target_box, patch, tv_weight=args.tv_weight,
+            )
 
             optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
 
-            with torch.no_grad():
-                patch.clamp_(0, 1)
+            empty_keep = int(n_kept == 0)
+            if patch.grad is None:
+                grad_mean, grad_max, grad_is_none = 0.0, 0.0, 1
+            else:
+                grad_mean = patch.grad.abs().mean().item()
+                grad_max = patch.grad.abs().max().item()
+                grad_is_none = 0
+
+            # box/coverage diagnostics -- to test whether loss is driven by
+            # patch-to-person coverage ratio (occlusion) rather than the
+            # adversarial pattern itself. patch_size mirrors the exact
+            # computation in patch.py's paste_patch_on_box: box_h * scale.
+            x1, y1, x2, y2 = target_box
+            box_h = y2 - y1
+            box_w = x2 - x1
+            scale = eot_params["scale"]
+            patch_size = max(8, int(box_h * scale))
+            # fraction of the person's bbox area nominally covered by the
+            # (pre-rotation-clipping) square patch footprint
+            coverage_ratio = (patch_size * patch_size) / max(1e-6, (box_h * box_w))
+
+            log_writer.writerow([
+                epoch + 1, global_step, obj_l, tv_l, n_kept, empty_keep,
+                grad_mean, grad_max, grad_is_none,
+                box_h, box_w, scale, patch_size, coverage_ratio,
+            ])
+            log_file.flush()
+
+            if not args.gray_baseline:
+                optimizer.step()
+                with torch.no_grad():
+                    patch.clamp_(0, 1)
 
             epoch_obj_loss += obj_l
             epoch_tv_loss += tv_l
+            epoch_empty_keep += empty_keep
             n += 1
-            pbar.set_postfix(obj=epoch_obj_loss / n, tv=epoch_tv_loss / n)
+            global_step += 1
+            pbar.set_postfix(
+                obj=epoch_obj_loss / n,
+                tv=epoch_tv_loss / n,
+                empty_keep_pct=100.0 * epoch_empty_keep / n,
+                grad_mean=grad_mean,
+            )
 
-        # checkpoint the patch each epoch
-        torch.save(patch.detach().cpu(), os.path.join(args.out, f"patch_epoch{epoch+1}.pt"))
-        from torchvision.utils import save_image
-        save_image(patch.detach().cpu(), os.path.join(args.out, f"patch_epoch{epoch+1}.png"))
+        # checkpoint the patch each epoch (skip for gray-baseline: it's a
+        # fixed patch that never changes, saving it every epoch is pointless)
+        if not args.gray_baseline:
+            torch.save(patch.detach().cpu(), os.path.join(args.out, f"patch_epoch{epoch+1}.pt"))
+            from torchvision.utils import save_image
+            save_image(patch.detach().cpu(), os.path.join(args.out, f"patch_epoch{epoch+1}.png"))
 
-    print(f"done. patches saved to {args.out}/")
+        print(
+            f"epoch {epoch+1}: obj={epoch_obj_loss/n:.4f} tv={epoch_tv_loss/n:.4f} "
+            f"empty_keep={100.0*epoch_empty_keep/n:.1f}% of steps"
+        )
+
+    log_file.close()
+    print(f"done. patches saved to {args.out}/  step log: {log_path}")
 
 
 if __name__ == "__main__":
