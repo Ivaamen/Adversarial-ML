@@ -12,7 +12,7 @@ which shows how small changes to a particular image (either physically or digita
 
 ## How it Works
 
-Freezes the model's weights (by setting required_grad=False) while using gradient descent to decrease loss as the person's confidence score decreases. THe loss is taken on the input with respect to the 
+Freezes the model's weights (by setting required_grad=False) while using gradient descent to decrease loss as the person's confidence score decreases. The input is updated with respect to loss instead of the weights. 
 
 
 This project in particular focuses on producing images that would work in the real world, which requires additional consideration of these variables:
@@ -52,7 +52,7 @@ Thus, randomized scale, rotation, position, and lighting are applied across trai
 
 4.) Compare the model's dropoff between the two outputs.
 
-*The seed MUST be the same for both training and validation or significant change will be attributed to random chance.
+*The seed MUST be the same for both training and validation or significant change can be attributed to random chance.
 
 ## Future additions:
 
