@@ -15,6 +15,7 @@ import argparse
 import csv
 import os
 import random
+import time
 import torch
 from torch.utils.data import DataLoader
 from ultralytics import YOLO
@@ -102,6 +103,16 @@ def main():
                               "matched coverage is attributable to patch "
                               "CONTENT (adversarial pattern vs gray), not to "
                               "which images/placements got sampled.")
+    parser.add_argument("--profile", action="store_true",
+                         help="Time each pipeline segment per step (EOT "
+                              "compositing, model forward pass, loss+IoU-loop "
+                              "+backward) and print a summary at the end. "
+                              "Uses torch.cuda.synchronize() around GPU timing "
+                              "since CUDA calls are async -- without syncing, "
+                              "a naive time.time() only measures kernel launch "
+                              "overhead, not actual execution time. Adds sync "
+                              "overhead of its own, so don't leave this on for "
+                              "real training runs, only for one diagnostic run.")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -118,16 +129,21 @@ def main():
     dataset = CocoPersonDataset(args.data, split=args.split, img_size=args.img_size)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_single)
 
-    patch = init_patch(size=args.patch_size, mode="gray").to(device)
+    # init_patch() already sets requires_grad=True on the CPU tensor. Calling
+    # .to(device) on a tensor that already requires grad produces a NON-LEAF
+    # tensor (the result of the device-copy op), which torch.optim.Adam
+    # refuses to optimize -- "can't optimize a non-leaf Tensor". This is
+    # silent/harmless on CPU (where .to() on a no-op device transfer may
+    # return the same underlying leaf) but throws on GPU, where .to('cuda')
+    # is always a real op. Fix: move first, then detach + re-enable grad so
+    # the tensor becomes a genuine leaf at its final device.
+    patch = init_patch(size=args.patch_size, mode="gray").to(device).detach()
+    patch.requires_grad_(True)
     if args.gray_baseline:
-        # Fixed gray, never updated -- requires_grad stays True only because
-        # loss.py/autograd need SOME leaf with grad in the graph to trace
-        # back through (e.g. tv_loss, and objectness_loss's own graph), but
-        # we simply never call optimizer.step() so it never actually moves.
-        patch.requires_grad_(True)
+        # Fixed gray, never updated -- optimizer is created but never
+        # .step()'d, so the patch stays at its initial gray value throughout.
         optimizer = torch.optim.Adam([patch], lr=args.lr)  # unused, never .step()'d
     else:
-        patch.requires_grad_(True)
         optimizer = torch.optim.Adam([patch], lr=args.lr)
 
     # Per-step diagnostic log (CSV, written incrementally, flushed every step).
@@ -146,6 +162,10 @@ def main():
     ])
 
     global_step = 0
+    # profiling accumulators (only used if --profile)
+    prof_totals = {"eot": 0.0, "forward": 0.0, "loss_backward": 0.0}
+    prof_steps = 0
+
     for epoch in range(args.epochs):
         epoch_obj_loss, epoch_tv_loss, n = 0.0, 0.0, 0
         epoch_empty_keep = 0
@@ -155,11 +175,24 @@ def main():
             image, target_box, _all_boxes = batch[0]
             image = image.to(device)
 
+            if args.profile and device == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
             composited, eot_params = eot_composite(
                 image, patch, target_box,
                 scale_range=(args.scale_min, args.scale_max),
             )
+
+            if args.profile and device == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+
             raw_preds = get_raw_predictions(yolo, composited.unsqueeze(0))
+
+            if args.profile and device == "cuda":
+                torch.cuda.synchronize()
+            t2 = time.perf_counter()
 
             loss, obj_l, tv_l, n_kept = total_loss(
                 raw_preds, target_box, patch, tv_weight=args.tv_weight,
@@ -167,6 +200,22 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
+
+            if args.profile and device == "cuda":
+                torch.cuda.synchronize()
+            t3 = time.perf_counter()
+
+            if args.profile:
+                prof_totals["eot"] += (t1 - t0)
+                prof_totals["forward"] += (t2 - t1)
+                # this segment includes total_loss (with its Python-level IoU
+                # loop over every raw anchor) AND backward() -- both are CPU-
+                # side/autograd-graph work, lumped together deliberately since
+                # separating them needs another sync point and total_loss's
+                # cost (the suspected bottleneck) dominates this segment
+                # anyway for a frozen, tiny (nano) detector.
+                prof_totals["loss_backward"] += (t3 - t2)
+                prof_steps += 1
 
             empty_keep = int(n_kept == 0)
             if patch.grad is None:
@@ -226,6 +275,26 @@ def main():
         )
 
     log_file.close()
+
+    if args.profile and prof_steps > 0:
+        total = sum(prof_totals.values())
+        print("\n=== per-step timing breakdown (--profile) ===")
+        print(f"steps measured: {prof_steps}")
+        for name in ["eot", "forward", "loss_backward"]:
+            avg_ms = 1000 * prof_totals[name] / prof_steps
+            pct = 100 * prof_totals[name] / total
+            print(f"  {name:14s}: avg {avg_ms:7.2f} ms/step  ({pct:5.1f}% of measured time)")
+        print(f"  {'TOTAL':14s}: avg {1000*total/prof_steps:7.2f} ms/step")
+        print(
+            "note: 'loss_backward' includes total_loss's Python-level IoU "
+            "loop over every raw anchor (see loss.py objectness_loss) as "
+            "well as the actual backward() call. If this segment dominates "
+            "and 'forward' is small by comparison, the IoU loop -- not the "
+            "GPU model pass -- is the bottleneck, and vectorizing it (batched "
+            "tensor IoU instead of a per-anchor Python loop) is the fix, not "
+            "a faster GPU."
+        )
+
     print(f"done. patches saved to {args.out}/  step log: {log_path}")
 
 

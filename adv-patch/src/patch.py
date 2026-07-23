@@ -54,16 +54,20 @@ def rotate_patch(patch, angle_deg):
     """Rotate patch (and generate an alpha mask for the rotated corners)."""
     c, h, w = patch.shape
     angle = math.radians(angle_deg)
+    # theta/ones must be created on patch.device, not the default CPU --
+    # otherwise F.affine_grid builds `grid` on CPU (inheriting theta's
+    # device) while patch/model are on CUDA, and grid_sample throws a
+    # cross-device RuntimeError.
     theta = torch.tensor([
         [math.cos(angle), -math.sin(angle), 0],
         [math.sin(angle),  math.cos(angle), 0],
-    ], dtype=patch.dtype).unsqueeze(0)
+    ], dtype=patch.dtype, device=patch.device).unsqueeze(0)
 
     grid = F.affine_grid(theta, [1, c, h, w], align_corners=False)
     rotated = F.grid_sample(patch.unsqueeze(0), grid, align_corners=False, padding_mode="zeros")
 
     # alpha mask: 1 where patch content exists, 0 in the rotated-out corners
-    ones = torch.ones(1, 1, h, w)
+    ones = torch.ones(1, 1, h, w, dtype=patch.dtype, device=patch.device)
     alpha = F.grid_sample(ones, grid, align_corners=False, padding_mode="zeros")
 
     return rotated.squeeze(0), alpha.squeeze(0)
